@@ -29,7 +29,47 @@ function onOpen() {
     .addItem('Initialize session from START_SETUP', 'initializeSessionFromStartSetup')
     .addItem('Prepare ROUND_INPUT for next month', 'prepareRoundInputForNextMonth')
     .addItem('Run next month round', 'runNextMonthRound')
+    .addSeparator()
+    .addItem('Сбросить сессию', 'resetSessionWithConfirmation')
     .addToUi();
+}
+
+
+function resetSessionWithConfirmation() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Подтверждение сброса',
+    'Это удалит данные листов SESSION_CONFIG, TEAM_STATE, ROUND_RESULTS и ROUND_INPUT. Продолжить?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) {
+    ui.alert('Сброс отменен.');
+    return;
+  }
+
+  resetSessionSheets_();
+  ui.alert('Сессия сброшена до начального состояния.');
+}
+
+function resetSessionSheets_() {
+  const cfg = GAME_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const names = [
+    cfg.sessionConfigSheetName,
+    cfg.teamStateSheetName,
+    cfg.roundResultsSheetName,
+    cfg.roundInputSheetName
+  ];
+
+  names.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+    clearSheetCompletely_(sh);
+  });
+
+  SpreadsheetApp.flush();
 }
 
 function initializeSessionFromStartSetup() {
@@ -574,6 +614,21 @@ function calculateMonthRound_(ctx) {
   // -----------------------------------------------------------
   // Hidden state (pre-round deltas for repeat model)
   // -----------------------------------------------------------
+  const trainingServiceEffect = Math.min(trainingBudget * trainingServiceEffectCoef, trainingEffectCap);
+  const trainingQualityEffect = Math.min(trainingBudget * trainingQualityEffectCoef, trainingEffectCap);
+
+  let serviceNext = service + receptionScore * receptionServiceBonusCoef + trainingServiceEffect - burnout * burnoutServicePenaltyCoef;
+  serviceNext = clamp_(serviceNext, stateMin, stateMax);
+
+  let qualityNext = quality + trainingQualityEffect - burnout * burnoutQualityPenaltyCoef;
+  qualityNext = clamp_(qualityNext, stateMin, stateMax);
+
+  let reputationNext = reputation + quality * qualityReputationBonusCoef + service * serviceReputationBonusCoef - pressureIndex * aggressiveSalesReputationPenalty;
+  reputationNext = clamp_(reputationNext, stateMin, stateMax);
+
+  let loyaltyNext = loyalty + quality * qualityLoyaltyBonusCoef + service * serviceLoyaltyBonusCoef + reputation * reputationLoyaltyBonusCoef - fireCount * fireLoyaltyPenalty;
+  loyaltyNext = clamp_(loyaltyNext, stateMin, stateMax);
+
   const deltaRep = reputationNext - reputation;
   const deltaQual = qualityNext - quality;
   const deltaSer = serviceNext - service;
