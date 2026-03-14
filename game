@@ -89,6 +89,10 @@ function initializeSessionFromStartSetup() {
   ensureTechParametersDefaults_(techSheet);
   const techParams = readTechParamsMap_(techSheet);
 
+  if (techParams.start_cash_balance === '' || techParams.start_cash_balance === null || techParams.start_cash_balance === undefined || isNaN(Number(techParams.start_cash_balance))) {
+    throw new Error('В TECH_PARAMETERS должен быть задан start_cash_balance (из 08_Coefficients).');
+  }
+
   clearSheetCompletely_(sessionConfigSheet);
   clearSheetCompletely_(teamStateSheet);
   clearSheetCompletely_(roundResultsSheet);
@@ -325,8 +329,8 @@ function writeSessionConfigSheet_(sheet, setup, derived, tech, cfg) {
     ['ROOM_SETUP', 'max_ftl_doctors', derived.max_ftl_doctors, 'Максимум врачей на ФТЛ'],
     ['ROOM_SETUP', 'total_doctor_slots', derived.total_doctor_slots, 'Слоты по всем кабинетам'],
 
-    ['INITIAL_PRICING', 'initial_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', 3000), 'Стартовая цена приема'],
-    ['INITIAL_PRICING', 'initial_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', 500), 'Стартовая цена процедуры'],
+    ['INITIAL_PRICING', 'initial_visit_price', getNumberOrDefault_(tech, 'base_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', 3000)), 'Стартовая цена приема'],
+    ['INITIAL_PRICING', 'initial_procedure_price', getNumberOrDefault_(tech, 'base_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', 500)), 'Стартовая цена процедуры'],
 
     ['ENVIRONMENT', 'env_economy', getNumberOrDefault_(tech, 'env_economy', 50), 'Стартовая экономика'],
     ['ENVIRONMENT', 'env_competition', getNumberOrDefault_(tech, 'env_competition', 50), 'Стартовая конкуренция'],
@@ -342,7 +346,7 @@ function writeSessionConfigSheet_(sheet, setup, derived, tech, cfg) {
     ['TECH', 'procedures_per_shift', derived.procedures_per_shift, 'Процедур за смену'],
     ['TECH', 'procedures_per_course', derived.procedures_per_course, 'Процедур в курсе'],
 
-    ['FINANCE', 'start_cash_balance', getNumberOrDefault_(tech, 'start_cash_balance', 1000000), 'Стартовый капитал'],
+    ['FINANCE', 'start_cash_balance', Number(tech.start_cash_balance), 'Стартовый капитал'],
     ['FINANCE', 'base_cpl', getNumberOrDefault_(tech, 'base_cpl', 1000), 'Базовый CPL'],
     ['FINANCE', 'base_rent_month', getNumberOrDefault_(tech, 'base_rent_month', 500000), 'Базовая аренда в месяц'],
     ['FINANCE', 'doctor_salary_month', getNumberOrDefault_(tech, 'doctor_salary_month', 250000), 'Зарплата врача в месяц'],
@@ -364,7 +368,7 @@ function writeTeamStateSheet_(sheet, setup, derived, tech, cfg) {
     getNumberOrDefault_(tech, 'loyalty_start', 50),
     getNumberOrDefault_(tech, 'patient_base_start', 200),
     getNumberOrDefault_(tech, 'market_share_start', 0.05),
-    getNumberOrDefault_(tech, 'start_cash_balance', 1000000),
+    Number(tech.start_cash_balance),
     Number(derived.doctors_current), Number(derived.visit_rooms), Number(derived.ftl_rooms),
     Number(derived.max_visit_doctors), Number(derived.max_ftl_doctors), Number(derived.total_doctor_slots),
     getNumberOrDefault_(tech, 'max_doctor_load_percent', 90),
@@ -387,12 +391,12 @@ function writeRoundResultsBaseline_(sheet, setup, derived, tech, cfg) {
 
     0, 0, 0, 0, 0, 0, 0, 0, getNumberOrDefault_(tech, 'market_share_start', 0.05),
 
-    getNumberOrDefault_(tech, 'initial_visit_price', 3000), getNumberOrDefault_(tech, 'initial_procedure_price', 500),
+    getNumberOrDefault_(tech, 'base_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', 3000)), getNumberOrDefault_(tech, 'base_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', 500)),
     0, 0, 0, 0, 0, 0,
 
     0, 0, 0,
 
-    0, 0, 0, 0, getNumberOrDefault_(tech, 'start_cash_balance', 1000000),
+    0, 0, 0, 0, Number(tech.start_cash_balance),
 
     0, 0, 0, 0,
 

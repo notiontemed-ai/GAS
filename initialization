@@ -380,6 +380,9 @@ function buildTechMasterRegistryRows_(ss) {
   const hiddenStart = buildHiddenStateStartMap_(ss);
   const constantsMap = buildConstantsMap_(ss);
   const startCashFromCoeff = getCoefficientValueByCode_(ss, 'start_cash_balance');
+  if (startCashFromCoeff === null || startCashFromCoeff === undefined || startCashFromCoeff === '') {
+    throw new Error('В 08_Coefficients отсутствует start_cash_balance в колонке "Пример значения (input)".');
+  }
 
   const pick = (k, d) => (k in map && map[k] !== '' && map[k] !== null && map[k] !== undefined) ? map[k] : d;
   const pickConst = (k, d) => (k in constantsMap && constantsMap[k] !== '' && constantsMap[k] !== null && constantsMap[k] !== undefined) ? constantsMap[k] : d;
@@ -397,7 +400,9 @@ function buildTechMasterRegistryRows_(ss) {
     ['FIN','base_rent_month', pick('base_rent_month',500000), 'Master registry'],
     ['FIN','doctor_salary_month', pick('doctor_salary_month',250000), 'Master registry'],
     ['FIN','base_admin_cost', pick('base_admin_cost',150000), 'Master registry'],
-    ['FIN','start_cash_balance', (startCashFromCoeff !== null && startCashFromCoeff !== undefined && startCashFromCoeff !== '') ? startCashFromCoeff : pick('start_cash_balance',1000000), 'Master registry'],
+    ['FIN','start_cash_balance', startCashFromCoeff, 'Master registry (from 08_Coefficients)'],
+    ['FIN','base_visit_price', pick('base_visit_price', pick('initial_visit_price', 3000)), 'Master registry (from 08_Coefficients)'],
+    ['FIN','base_procedure_price', pick('base_procedure_price', pick('initial_procedure_price', 500)), 'Master registry (from 08_Coefficients)'],
 
     ['CAPACITY','work_shifts_per_doctor', pickConst('work_shifts_per_doctor', 15), 'Imported from 07_Constants / Значение (input)'],
     ['CAPACITY','work_shifts_per_month', pickConst('work_shifts_per_doctor', pick('work_shifts_per_month',15)), 'Alias for engine compatibility'],
