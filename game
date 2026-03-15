@@ -581,29 +581,22 @@ function calculateMonthRound_(ctx) {
   const kBurnoutToConversion = getNumberOrDefault_(tech, 'k_burnout_to_conversion', -0.002);
 
   const baseRepeatRate = getNumberOrDefault_(tech, 'base_repeat_rate', 0.1);
-  const repeatRateMin = getNumberOrDefault_(tech, 'repeat_rate_min', 0);
-  const repeatRateMax = getNumberOrDefault_(tech, 'repeat_rate_max', 0.5);
-
   const kReputationToRepeat = getNumberOrDefault_(tech, 'k_reputation_to_repeat', 0.01);
-  const kQualityToRepeat = getNumberOrDefault_(tech, 'k_quality_to_repeat', 0.01);
-  const kServiceToRepeat = getNumberOrDefault_(tech, 'k_service_to_repeat', 0.01);
-  const kLoyaltyToRepeat = getNumberOrDefault_(tech, 'k_loyalty_to_repeat', 0.01);
 
   const trainingServiceEffectCoef = getNumberOrDefault_(tech, 'training_service_effect_coef', 0.00001);
   const trainingQualityEffectCoef = getNumberOrDefault_(tech, 'training_quality_effect_coef', 0.00002);
   const trainingEffectCap = getNumberOrDefault_(tech, 'training_effect_cap', 5);
 
-  const receptionServiceBonusCoef = getNumberOrDefault_(tech, 'reception_service_bonus_coef', 0.05);
   const burnoutServicePenaltyCoef = getNumberOrDefault_(tech, 'burnout_service_penalty_coef', 0.10);
   const burnoutQualityPenaltyCoef = getNumberOrDefault_(tech, 'burnout_quality_penalty_coef', 0.15);
+  const kLoyaltyToService = getNumberOrDefault_(tech, 'k_loyalty_to_service', 0.03);
+  const kLoyaltyToQuality = getNumberOrDefault_(tech, 'k_loyalty_to_quality', 0.03);
 
   const qualityReputationBonusCoef = getNumberOrDefault_(tech, 'quality_reputation_bonus_coef', 0.05);
   const serviceReputationBonusCoef = getNumberOrDefault_(tech, 'service_reputation_bonus_coef', 0.05);
   const aggressiveSalesReputationPenalty = getNumberOrDefault_(tech, 'aggressive_sales_reputation_penalty', 0.08);
 
-  const qualityLoyaltyBonusCoef = getNumberOrDefault_(tech, 'quality_loyalty_bonus_coef', 0.03);
-  const serviceLoyaltyBonusCoef = getNumberOrDefault_(tech, 'service_loyalty_bonus_coef', 0.03);
-  const reputationLoyaltyBonusCoef = getNumberOrDefault_(tech, 'reputation_loyalty_bonus_coef', 0.03);
+  const stabilityBonus = getNumberOrDefault_(tech, 'stability_bonus', 0);
   const fireLoyaltyPenalty = getNumberOrDefault_(tech, 'fire_loyalty_penalty', 10);
 
   const staffComfortBurnoutReliefCoef = getNumberOrDefault_(tech, 'staff_comfort_burnout_relief_coef', 0.03);
@@ -621,29 +614,24 @@ function calculateMonthRound_(ctx) {
   const trainingServiceEffect = Math.min(trainingBudget * trainingServiceEffectCoef, trainingEffectCap);
   const trainingQualityEffect = Math.min(trainingBudget * trainingQualityEffectCoef, trainingEffectCap);
 
-  let serviceNext = service + receptionScore * receptionServiceBonusCoef + trainingServiceEffect - burnout * burnoutServicePenaltyCoef;
-  serviceNext = clamp_(serviceNext, stateMin, stateMax);
-
-  let qualityNext = quality + trainingQualityEffect - burnout * burnoutQualityPenaltyCoef;
-  qualityNext = clamp_(qualityNext, stateMin, stateMax);
-
-  let reputationNext = reputation + quality * qualityReputationBonusCoef + service * serviceReputationBonusCoef - pressureIndex * aggressiveSalesReputationPenalty;
-  reputationNext = clamp_(reputationNext, stateMin, stateMax);
-
-  let loyaltyNext = loyalty + quality * qualityLoyaltyBonusCoef + service * serviceLoyaltyBonusCoef + reputation * reputationLoyaltyBonusCoef - fireCount * fireLoyaltyPenalty;
+  let loyaltyNext = loyalty + stabilityBonus - fireCount * fireLoyaltyPenalty;
   loyaltyNext = clamp_(loyaltyNext, stateMin, stateMax);
 
-  const deltaRep = reputationNext - reputation;
-  const deltaQual = qualityNext - quality;
-  const deltaSer = serviceNext - service;
-  const deltaLoy = loyaltyNext - loyalty;
+  let serviceNext = service + loyalty * kLoyaltyToService + trainingServiceEffect - burnout * burnoutServicePenaltyCoef;
+  serviceNext = clamp_(serviceNext, stateMin, stateMax);
+
+  let qualityNext = quality + loyalty * kLoyaltyToQuality + trainingQualityEffect - burnout * burnoutQualityPenaltyCoef;
+  qualityNext = clamp_(qualityNext, stateMin, stateMax);
+
+  const pressurePenalty = pressureIndex * aggressiveSalesReputationPenalty;
+  let reputationNext = reputation + qualityNext * qualityReputationBonusCoef + serviceNext * serviceReputationBonusCoef - pressurePenalty;
+  reputationNext = clamp_(reputationNext, stateMin, stateMax);
+
+  const deltaReputation = reputationNext - reputation;
 
   let repeatRate =
     baseRepeatRate +
-    kReputationToRepeat * deltaRep +
-    kQualityToRepeat * deltaQual +
-    kServiceToRepeat * deltaSer +
-    kLoyaltyToRepeat * deltaLoy;
+    kReputationToRepeat * deltaReputation;
 
   // Жесткий clamp по ТЗ
   repeatRate = clamp_(repeatRate, 0, 0.5);
@@ -655,14 +643,24 @@ function calculateMonthRound_(ctx) {
   const visitCapacityLimited = visitCapacity * loadFactor;
   const procedureCapacityLimited = procedureCapacity * loadFactor;
 
-  const effectiveCpl = baseCpl * (1 + alpha * Math.pow(Math.max(marketSharePrev, 0), beta));
-  const adLeads = safeDiv_(marketingBudget, effectiveCpl);
+  const marketingSteps = 10;
+  const marketingBudgetPerStep = safeDiv_(marketingBudget, marketingSteps);
+  let marketShareDynamic = marketSharePrev;
+  let effectiveCpl = baseCpl * (1 + alpha * Math.pow(Math.max(marketShareDynamic, 0), beta));
+  let adLeads = 0;
+
+  for (let step = 0; step < marketingSteps; step += 1) {
+    effectiveCpl = baseCpl * (1 + alpha * Math.pow(Math.max(marketShareDynamic, 0), beta));
+    const stepLeads = safeDiv_(marketingBudgetPerStep, effectiveCpl);
+    adLeads += stepLeads;
+    marketShareDynamic = envTotalMarket > 0 ? Math.min(adLeads, envTotalMarket) / envTotalMarket : 0;
+  }
 
   let organicLeads =
     envBaseOrganic +
     kEconomyToDemand * envEconomy +
     kCompetitionToDemand * envCompetition +
-    kReputationToOrganic * reputation +
+    kReputationToOrganic * deltaReputation +
     kLocationToOrganic * locationScore;
   organicLeads = Math.max(0, organicLeads);
 
@@ -993,23 +991,19 @@ function ensureTechParametersDefaults_(sheet) {
     ['REPEAT', 'base_repeat_rate', 0.1, 'Базовый repeat'],
     ['REPEAT', 'repeat_rate_min', 0, 'Мин repeat'],
     ['REPEAT', 'repeat_rate_max', 0.5, 'Макс repeat'],
-    ['REPEAT', 'k_reputation_to_repeat', 0.01, 'Репутация→repeat'],
-    ['REPEAT', 'k_quality_to_repeat', 0.01, 'Качество→repeat'],
-    ['REPEAT', 'k_service_to_repeat', 0.01, 'Сервис→repeat'],
-    ['REPEAT', 'k_loyalty_to_repeat', 0.01, 'Лояльность→repeat'],
+    ['REPEAT', 'k_reputation_to_repeat', 0.01, 'ΔРепутации→repeat'],
 
     ['STATE_DYN', 'training_service_effect_coef', 0.00001, 'Обучение→сервис'],
     ['STATE_DYN', 'training_quality_effect_coef', 0.00002, 'Обучение→качество'],
     ['STATE_DYN', 'training_effect_cap', 5, 'Кэп эффекта обучения'],
-    ['STATE_DYN', 'reception_service_bonus_coef', 0.05, 'Ресепшен→сервис'],
+    ['STATE_DYN', 'k_loyalty_to_service', 0.03, 'Лояльность→сервис'],
+    ['STATE_DYN', 'k_loyalty_to_quality', 0.03, 'Лояльность→качество'],
     ['STATE_DYN', 'burnout_service_penalty_coef', 0.10, 'Выгорание штраф сервис'],
     ['STATE_DYN', 'burnout_quality_penalty_coef', 0.15, 'Выгорание штраф качество'],
     ['STATE_DYN', 'quality_reputation_bonus_coef', 0.05, 'Качество→репутация'],
     ['STATE_DYN', 'service_reputation_bonus_coef', 0.05, 'Сервис→репутация'],
     ['STATE_DYN', 'aggressive_sales_reputation_penalty', 0.08, 'Агресс. продажи штраф'],
-    ['STATE_DYN', 'quality_loyalty_bonus_coef', 0.03, 'Качество→лояльность'],
-    ['STATE_DYN', 'service_loyalty_bonus_coef', 0.03, 'Сервис→лояльность'],
-    ['STATE_DYN', 'reputation_loyalty_bonus_coef', 0.03, 'Репутация→лояльность'],
+    ['STATE_DYN', 'stability_bonus', 0, 'Автономный бонус стабильности лояльности'],
     ['STATE_DYN', 'fire_loyalty_penalty', 10, 'Увольнения штраф лояльности'],
     ['STATE_DYN', 'staff_comfort_burnout_relief_coef', 0.03, 'Комфорт персонала снижает выгорание'],
     ['STATE_DYN', 'kitchen_burnout_relief_coef', 0.02, 'Кухня снижает выгорание'],
