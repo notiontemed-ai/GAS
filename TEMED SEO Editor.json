@@ -1,0 +1,9 @@
+{
+  "name": "TEMED SEO Editor",
+  "nodes": [
+    {"parameters": {"path": "temed-seo", "authentication": "headerAuth"}, "name": "Webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [0,0], "credentials": {"httpHeaderAuth": {"name": "X-TEMED-SEO-SECRET"}}},
+    {"parameters": {"rules": {"values": [{"conditions": {"conditions": [{"leftValue": "={{$json.action}}", "rightValue": "assistant_chat", "operator": {"type": "string", "operation": "equals"}}]}},{"conditions": {"conditions": [{"leftValue": "={{$json.action}}", "rightValue": "start_external_uniqueness", "operator": {"type": "string", "operation": "equals"}}]}},{"conditions": {"conditions": [{"leftValue": "={{$json.action}}", "rightValue": "get_external_uniqueness", "operator": {"type": "string", "operation": "equals"}}]}}]}}, "name": "Route actions", "type": "n8n-nodes-base.switch", "typeVersion": 3, "position": [220,0]}
+  ],
+  "connections": {},
+  "settings": {}
+}
