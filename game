@@ -1,0 +1,1079 @@
+/***************************************************************
+ * CLINIC GAME — UNIFIED SESSION + MONTH ENGINE
+ * =============================================================
+ * Версия с исправлениями:
+ * 1) Единая схема ROUND_RESULTS для round 0 и round 1+
+ * 2) Автозаполнение TECH_PARAMETERS дефолтами, если лист пуст
+ * 3) Удалены дубли утилит и форматтеров
+ ***************************************************************/
+
+const GAME_CONFIG = {
+  startSheetName: 'START_SETUP',
+  techSheetName: 'TECH_PARAMETERS',
+  sessionConfigSheetName: 'SESSION_CONFIG',
+  teamStateSheetName: 'TEAM_STATE',
+  roundResultsSheetName: 'ROUND_RESULTS',
+  roundInputSheetName: 'ROUND_INPUT',
+  timezone: 'Europe/Paris',
+  teamId: 'TEAM_01',
+  teamName: 'Main Team'
+};
+
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Clinic Game Session')
+    .addItem('Create new game session from catalog', 'createNewGameSessionFromCatalog')
+    .addSeparator()
+    .addItem('Sync START_SETUP with lot catalog', 'syncStartSetupWithLotCatalog')
+    .addItem('Initialize session from START_SETUP', 'initializeSessionFromStartSetup')
+    .addItem('Prepare ROUND_INPUT for next month', 'prepareRoundInputForNextMonth')
+    .addItem('Run next month round', 'runNextMonthRound')
+    .addSeparator()
+    .addItem('Сбросить сессию', 'resetSessionWithConfirmation')
+    .addToUi();
+}
+
+
+function resetSessionWithConfirmation() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert(
+    'Подтверждение сброса',
+    'Это удалит данные листов SESSION_CONFIG, TEAM_STATE, ROUND_RESULTS и ROUND_INPUT. Продолжить?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) {
+    ui.alert('Сброс отменен.');
+    return;
+  }
+
+  resetSessionSheets_();
+  ui.alert('Сессия сброшена до начального состояния.');
+}
+
+function resetSessionSheets_() {
+  const cfg = GAME_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const names = [
+    cfg.sessionConfigSheetName,
+    cfg.teamStateSheetName,
+    cfg.roundResultsSheetName,
+    cfg.roundInputSheetName
+  ];
+
+  names.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+    clearSheetCompletely_(sh);
+  });
+
+  SpreadsheetApp.flush();
+}
+
+function initializeSessionFromStartSetup() {
+  const cfg = GAME_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const startSheet = mustGetSheet_(ss, cfg.startSheetName);
+  const techSheet = getOrCreateSheet_(ss, cfg.techSheetName);
+  const sessionConfigSheet = getOrCreateSheet_(ss, cfg.sessionConfigSheetName);
+  const teamStateSheet = getOrCreateSheet_(ss, cfg.teamStateSheetName);
+  const roundResultsSheet = getOrCreateSheet_(ss, cfg.roundResultsSheetName);
+
+  const startSetup = readStartSetup_(startSheet);
+  validateStartSetup_(startSetup);
+  const derived = deriveInitialSessionValues_(startSetup);
+
+  ensureTechParametersDefaults_(techSheet);
+  const techParams = readTechParamsMap_(techSheet);
+
+  if (techParams.start_cash_balance === '' || techParams.start_cash_balance === null || techParams.start_cash_balance === undefined || isNaN(Number(techParams.start_cash_balance))) {
+    throw new Error('В TECH_PARAMETERS должен быть задан start_cash_balance (из 08_Coefficients).');
+  }
+
+  clearSheetCompletely_(sessionConfigSheet);
+  clearSheetCompletely_(teamStateSheet);
+  clearSheetCompletely_(roundResultsSheet);
+
+  writeSessionConfigSheet_(sessionConfigSheet, startSetup, derived, techParams, cfg);
+  writeTeamStateSheet_(teamStateSheet, startSetup, derived, techParams, cfg);
+  writeRoundResultsBaseline_(roundResultsSheet, startSetup, derived, techParams, cfg);
+
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert(
+    'Игровая сессия инициализирована.\n' +
+    'Созданы/обновлены SESSION_CONFIG, TEAM_STATE, ROUND_RESULTS и TECH_PARAMETERS.'
+  );
+}
+
+function prepareRoundInputForNextMonth() {
+  const cfg = GAME_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const teamStateSheet = mustGetSheet_(ss, cfg.teamStateSheetName);
+  const roundInputSheet = getOrCreateSheet_(ss, cfg.roundInputSheetName);
+  const sessionConfigSheet = mustGetSheet_(ss, cfg.sessionConfigSheetName);
+  const techSheet = getOrCreateSheet_(ss, cfg.techSheetName);
+
+  ensureTechParametersDefaults_(techSheet);
+
+  const latestState = getLatestTeamState_(teamStateSheet, cfg.teamId);
+  const nextRoundNo = Number(latestState.round_no) + 1;
+
+  ensureRoundInputHeaders_(roundInputSheet);
+
+  const existingRow = findRoundInputRow_(roundInputSheet, cfg.teamId, nextRoundNo);
+  if (existingRow) {
+    SpreadsheetApp.getUi().alert(
+      `ROUND_INPUT для round_no=${nextRoundNo} уже существует в строке ${existingRow}.`
+    );
+    return;
+  }
+
+  const sessionConfig = readSessionConfigMap_(sessionConfigSheet);
+  const techParams = readTechParamsMap_(techSheet);
+
+  const defaultVisitPrice = Number(sessionConfig.initial_visit_price || 0);
+  const defaultProcedurePrice = Number(sessionConfig.initial_procedure_price || 0);
+
+  const doctorsCurrent = Number(latestState.doctors_current || 0);
+  const visitRooms = Number(latestState.visit_rooms || 0);
+  const ftlRooms = Number(latestState.ftl_rooms || 0);
+
+  const maxVisitDoctors = visitRooms * 2;
+  const maxFtlDoctors = ftlRooms * 2;
+
+  const defaultVisitAssigned = Math.min(doctorsCurrent, maxVisitDoctors);
+  const defaultFtlAssigned = doctorsCurrent - defaultVisitAssigned;
+
+  const balancedFtl = Math.min(maxFtlDoctors, Math.max(0, defaultFtlAssigned));
+  const balancedVisit = doctorsCurrent - balancedFtl;
+
+  appendRoundInputRow_(roundInputSheet, {
+    round_no: nextRoundNo,
+    team_id: cfg.teamId,
+    team_name: cfg.teamName,
+    visit_price: defaultVisitPrice,
+    procedure_price: defaultProcedurePrice,
+    marketing_budget: getNumberOrDefault_(techParams, 'default_marketing_budget', 0),
+    training_budget: getNumberOrDefault_(techParams, 'default_training_budget', 0),
+    hire_count: 0,
+    fire_count: 0,
+    doctors_visit_assigned: balancedVisit,
+    doctors_ftl_assigned: balancedFtl,
+    max_doctor_load_percent: getNumberOrDefault_(latestState, 'max_doctor_load_percent', 100),
+    comment: 'Autogenerated defaults'
+  });
+
+  SpreadsheetApp.getUi().alert(`ROUND_INPUT подготовлен для round_no=${nextRoundNo}.`);
+}
+
+function runNextMonthRound() {
+  const cfg = GAME_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const sessionConfigSheet = mustGetSheet_(ss, cfg.sessionConfigSheetName);
+  const teamStateSheet = mustGetSheet_(ss, cfg.teamStateSheetName);
+  const roundResultsSheet = mustGetSheet_(ss, cfg.roundResultsSheetName);
+  const roundInputSheet = mustGetSheet_(ss, cfg.roundInputSheetName);
+  const techSheet = getOrCreateSheet_(ss, cfg.techSheetName);
+
+  ensureTechParametersDefaults_(techSheet);
+
+  const sessionConfig = readSessionConfigMap_(sessionConfigSheet);
+  const techParams = readTechParamsMap_(techSheet);
+  const latestState = getLatestTeamState_(teamStateSheet, cfg.teamId);
+
+  const nextRoundNo = Number(latestState.round_no) + 1;
+  const roundInput = readRoundInputForRound_(roundInputSheet, cfg.teamId, nextRoundNo);
+
+  validateRoundInput_(roundInput, latestState);
+
+  const calc = calculateMonthRound_({
+    sessionConfig,
+    techParams,
+    latestState,
+    roundInput
+  });
+
+  appendRoundResult_(roundResultsSheet, calc, cfg);
+  appendTeamState_(teamStateSheet, calc, cfg);
+
+  SpreadsheetApp.flush();
+
+  let message =
+    `Раунд ${nextRoundNo} рассчитан.\n` +
+    `Выручка: ${roundNumber_(calc.total_revenue)}\n` +
+    `Расходы: ${roundNumber_(calc.total_cost)}\n` +
+    `Финрезультат: ${roundNumber_(calc.financial_result)}\n` +
+    `Остаток: ${roundNumber_(calc.cash_balance_next)}`;
+
+  if (calc.cash_balance_next < 0) {
+    message += '\n\nВНИМАНИЕ: Денежный остаток ниже нуля. Команда проигрывает.';
+  }
+
+  SpreadsheetApp.getUi().alert(message);
+}
+
+function readStartSetup_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('Лист START_SETUP пуст или не содержит данных.');
+
+  const setup = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const parameterCode = String(row[1] || '').trim();
+    const valueInput = row[3];
+    if (!parameterCode) continue;
+    setup[parameterCode] = valueInput;
+  }
+  return setup;
+}
+
+function validateStartSetup_(setup) {
+  const requiredFields = [
+    'team_name',
+    'selected_lot_id',
+    'selected_lot_name',
+    'selected_total_cabinets',
+    'selected_rent_coef',
+    'selected_location_score',
+    'selected_building_score',
+    'selected_parking_score',
+    'selected_staff_comfort',
+    'selected_reception_score',
+    'selected_kitchen_score',
+    'visit_rooms',
+    'ftl_rooms',
+    'doctors_start'
+  ];
+
+  const missing = requiredFields.filter(f => {
+    const v = setup[f];
+    return v === '' || v === null || v === undefined;
+  });
+  if (missing.length) throw new Error('Не заполнены обязательные поля START_SETUP:\n' + missing.join(', '));
+
+  const numericFields = [
+    'selected_total_cabinets', 'selected_rent_coef', 'selected_location_score', 'selected_building_score',
+    'selected_parking_score', 'selected_staff_comfort', 'selected_reception_score', 'selected_kitchen_score',
+    'visit_rooms', 'ftl_rooms', 'doctors_start'
+  ];
+
+  const badNumbers = numericFields.filter(f => isNaN(Number(setup[f])));
+  if (badNumbers.length) throw new Error('Следующие поля должны быть числовыми:\n' + badNumbers.join(', '));
+
+  const totalCabinets = Number(setup.selected_total_cabinets);
+  const visitRooms = Number(setup.visit_rooms);
+  const ftlRooms = Number(setup.ftl_rooms);
+  const doctorsStart = Number(setup.doctors_start);
+
+
+  if (visitRooms + ftlRooms !== totalCabinets) {
+    throw new Error(`Сумма visit_rooms (${visitRooms}) и ftl_rooms (${ftlRooms}) должна быть равна total_cabinets (${totalCabinets}).`);
+  }
+
+  const maxDoctorSlots = totalCabinets * 2;
+  if (doctorsStart > maxDoctorSlots) {
+    throw new Error(`Стартовое число врачей (${doctorsStart}) не может превышать число слотов (${maxDoctorSlots}).`);
+  }
+  if (doctorsStart < 0) throw new Error('Стартовое число врачей не может быть отрицательным.');
+}
+
+function deriveInitialSessionValues_(setup) {
+  const totalCabinets = Number(setup.selected_total_cabinets);
+  const visitRooms = Number(setup.visit_rooms);
+  const ftlRooms = Number(setup.ftl_rooms);
+  const doctorsStart = Number(setup.doctors_start);
+  const maxLoadPercent = 90;
+
+  return {
+    total_cabinets: totalCabinets,
+    visit_rooms: visitRooms,
+    ftl_rooms: ftlRooms,
+    max_visit_doctors: visitRooms * 2,
+    max_ftl_doctors: ftlRooms * 2,
+    total_doctor_slots: totalCabinets * 2,
+    doctors_current: doctorsStart,
+    load_factor: maxLoadPercent / 100,
+    shifts_per_doctor_per_month: 15,
+    visits_per_shift: 10,
+    procedures_per_shift: 50,
+    procedures_per_course: 10
+  };
+}
+
+function writeSessionConfigSheet_(sheet, setup, derived, tech, cfg) {
+  const rows = [
+    ['block', 'parameter_code', 'value', 'comment'],
+    ['SESSION', 'team_id', cfg.teamId, 'ID команды'],
+    ['SESSION', 'team_name', setup.team_name || cfg.teamName, 'Имя команды'],
+    ['SESSION', 'initialized_at', new Date(), 'Дата и время инициализации'],
+
+    ['LOT', 'selected_lot_id', setup.selected_lot_id, 'Выбранный лот'],
+    ['LOT', 'selected_lot_name', setup.selected_lot_name, 'Название лота'],
+    ['LOT', 'selected_total_cabinets', setup.selected_total_cabinets, 'Всего кабинетов'],
+    ['LOT', 'selected_rent_coef', setup.selected_rent_coef, 'Коэффициент аренды'],
+    ['LOT', 'selected_location_score', setup.selected_location_score, 'Сила локации'],
+    ['LOT', 'selected_building_score', setup.selected_building_score, 'Качество здания'],
+    ['LOT', 'selected_parking_score', setup.selected_parking_score, 'Парковка'],
+    ['LOT', 'selected_staff_comfort', setup.selected_staff_comfort, 'Комфорт персонала'],
+    ['LOT', 'selected_reception_score', setup.selected_reception_score, 'Качество фронта'],
+    ['LOT', 'selected_kitchen_score', setup.selected_kitchen_score, 'Бытовой комфорт'],
+
+    ['ROOM_SETUP', 'visit_rooms', setup.visit_rooms, 'Приемные кабинеты'],
+    ['ROOM_SETUP', 'ftl_rooms', setup.ftl_rooms, 'ФТЛ кабинеты'],
+    ['ROOM_SETUP', 'max_visit_doctors', derived.max_visit_doctors, 'Максимум врачей на приемах'],
+    ['ROOM_SETUP', 'max_ftl_doctors', derived.max_ftl_doctors, 'Максимум врачей на ФТЛ'],
+    ['ROOM_SETUP', 'total_doctor_slots', derived.total_doctor_slots, 'Слоты по всем кабинетам'],
+
+    ['INITIAL_PRICING', 'initial_visit_price', getNumberOrDefault_(tech, 'base_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', 3000)), 'Стартовая цена приема'],
+    ['INITIAL_PRICING', 'initial_procedure_price', getNumberOrDefault_(tech, 'base_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', 500)), 'Стартовая цена процедуры'],
+
+    ['ENVIRONMENT', 'env_economy', getNumberOrDefault_(tech, 'env_economy', 50), 'Стартовая экономика'],
+    ['ENVIRONMENT', 'env_competition', getNumberOrDefault_(tech, 'env_competition', 50), 'Стартовая конкуренция'],
+    ['ENVIRONMENT', 'env_total_market', getNumberOrDefault_(tech, 'env_total_market', 1000), 'Рынок новых обращений'],
+    ['ENVIRONMENT', 'env_base_demand', getNumberOrDefault_(tech, 'env_base_demand', 50), 'Базовый спрос'],
+    ['ENVIRONMENT', 'env_base_organic', getNumberOrDefault_(tech, 'env_base_organic', 100), 'Базовая органика'],
+
+    ['LOAD_POLICY', 'max_doctor_load_percent', getNumberOrDefault_(tech, 'max_doctor_load_percent', 90), 'Макс. загрузка'],
+    ['LOAD_POLICY', 'load_factor', getNumberOrDefault_(tech, 'max_doctor_load_percent', 90) / 100, 'Коэффициент мощности'],
+
+    ['TECH', 'shifts_per_doctor_per_month', derived.shifts_per_doctor_per_month, 'Смен на врача'],
+    ['TECH', 'visits_per_shift', derived.visits_per_shift, 'Приемов за смену'],
+    ['TECH', 'procedures_per_shift', derived.procedures_per_shift, 'Процедур за смену'],
+    ['TECH', 'procedures_per_course', derived.procedures_per_course, 'Процедур в курсе'],
+
+    ['FINANCE', 'start_cash_balance', Number(tech.start_cash_balance), 'Стартовый капитал'],
+    ['FINANCE', 'base_cpl', getNumberOrDefault_(tech, 'base_cpl', 1000), 'Базовый CPL'],
+    ['FINANCE', 'base_rent_month', getNumberOrDefault_(tech, 'base_rent_month', 500000), 'Базовая аренда в месяц'],
+    ['FINANCE', 'doctor_salary_month', getNumberOrDefault_(tech, 'doctor_salary_month', 250000), 'Зарплата врача в месяц'],
+    ['FINANCE', 'base_admin_cost', getNumberOrDefault_(tech, 'base_admin_cost', 150000), 'Базовые административные расходы']
+  ];
+
+  sheet.getRange(1, 1, rows.length, 4).setValues(rows);
+  formatSimpleSheet_(sheet, 4);
+}
+
+function writeTeamStateSheet_(sheet, setup, derived, tech, cfg) {
+  const headers = getTeamStateHeaders_();
+  const row = [
+    0, cfg.teamId, setup.team_name || cfg.teamName,
+    getNumberOrDefault_(tech, 'reputation_start', 50),
+    getNumberOrDefault_(tech, 'service_start', 50),
+    getNumberOrDefault_(tech, 'quality_start', 50),
+    getNumberOrDefault_(tech, 'burnout_start', 20),
+    getNumberOrDefault_(tech, 'loyalty_start', 50),
+    getNumberOrDefault_(tech, 'patient_base_start', 200),
+    getNumberOrDefault_(tech, 'market_share_start', 0.05),
+    Number(tech.start_cash_balance),
+    Number(derived.doctors_current), Number(derived.visit_rooms), Number(derived.ftl_rooms),
+    Number(derived.max_visit_doctors), Number(derived.max_ftl_doctors), Number(derived.total_doctor_slots),
+    getNumberOrDefault_(tech, 'max_doctor_load_percent', 90),
+    getNumberOrDefault_(tech, 'max_doctor_load_percent', 90) / 100,
+    'Initial state created from START_SETUP'
+  ];
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(2, 1, 1, headers.length).setValues([row]);
+  formatSimpleSheet_(sheet, headers.length);
+}
+
+function writeRoundResultsBaseline_(sheet, setup, derived, tech, cfg) {
+  const headers = getRoundResultsHeaders_();
+  const row = [
+    0, cfg.teamId, setup.team_name || cfg.teamName,
+    Number(setup.visit_rooms), Number(setup.ftl_rooms), Number(setup.doctors_start),
+    Number(setup.doctors_start), 0,
+    getNumberOrDefault_(tech, 'max_doctor_load_percent', 90), getNumberOrDefault_(tech, 'max_doctor_load_percent', 90) / 100,
+
+    0, 0, 0, 0, 0, 0, 0, 0, getNumberOrDefault_(tech, 'market_share_start', 0.05),
+
+    getNumberOrDefault_(tech, 'base_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', 3000)), getNumberOrDefault_(tech, 'base_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', 500)),
+    0, 0, 0, 0, 0, 0,
+
+    0, 0, 0,
+
+    0, 0, 0, 0, Number(tech.start_cash_balance),
+
+    0, 0, 0, 0,
+
+    'Round 0 baseline created during session initialization'
+  ];
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(2, 1, 1, headers.length).setValues([row]);
+  formatSimpleSheet_(sheet, headers.length);
+}
+
+function ensureRoundInputHeaders_(sheet) {
+  if (sheet.getLastRow() > 0) return;
+  const headers = [
+    'round_no', 'team_id', 'team_name', 'visit_price', 'procedure_price',
+    'marketing_budget', 'training_budget', 'hire_count', 'fire_count',
+    'doctors_visit_assigned', 'doctors_ftl_assigned', 'max_doctor_load_percent', 'comment'
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  formatSimpleSheet_(sheet, headers.length);
+}
+
+function findRoundInputRow_(sheet, teamId, roundNo) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return null;
+  const h = buildHeaderMap_(values[0]);
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (Number(row[h.round_no]) === Number(roundNo) && String(row[h.team_id] || '').trim() === String(teamId)) return r + 1;
+  }
+  return null;
+}
+
+function appendRoundInputRow_(sheet, data) {
+  sheet.appendRow([
+    data.round_no, data.team_id, data.team_name, data.visit_price, data.procedure_price,
+    data.marketing_budget, data.training_budget, data.hire_count, data.fire_count,
+    data.doctors_visit_assigned, data.doctors_ftl_assigned, data.max_doctor_load_percent,
+    data.comment || ''
+  ]);
+}
+
+function readRoundInputForRound_(sheet, teamId, roundNo) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('ROUND_INPUT пуст.');
+
+  const h = buildHeaderMap_(values[0]);
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const rowRound = Number(row[h.round_no]);
+    const rowTeam = String(row[h.team_id] || '').trim();
+
+    if (rowRound === Number(roundNo) && rowTeam === String(teamId)) {
+      return {
+        round_no: rowRound,
+        team_id: rowTeam,
+        team_name: row[h.team_name],
+        visit_price: Number(row[h.visit_price]),
+        procedure_price: Number(row[h.procedure_price]),
+        marketing_budget: Number(row[h.marketing_budget]),
+        training_budget: Number(row[h.training_budget]),
+        hire_count: Number(row[h.hire_count]),
+        fire_count: Number(row[h.fire_count]),
+        doctors_visit_assigned: Number(row[h.doctors_visit_assigned]),
+        doctors_ftl_assigned: Number(row[h.doctors_ftl_assigned]),
+        max_doctor_load_percent: Number(row[h.max_doctor_load_percent]),
+        comment: row[h.comment]
+      };
+    }
+  }
+
+  throw new Error(`Не найдена строка ROUND_INPUT для team_id=${teamId}, round_no=${roundNo}`);
+}
+
+function validateRoundInput_(roundInput, latestState) {
+  const doctorsCurrent = Number(latestState.doctors_current);
+  const maxVisitDoctors = Number(latestState.visit_rooms) * 2;
+  const maxFtlDoctors = Number(latestState.ftl_rooms) * 2;
+
+  const visitAssigned = Number(roundInput.doctors_visit_assigned);
+  const ftlAssigned = Number(roundInput.doctors_ftl_assigned);
+  const hireCount = Number(roundInput.hire_count);
+  const fireCount = Number(roundInput.fire_count);
+
+  if (visitAssigned + ftlAssigned !== doctorsCurrent) {
+    throw new Error(`В ROUND_INPUT сумма doctors_visit_assigned (${visitAssigned}) и doctors_ftl_assigned (${ftlAssigned}) должна быть равна doctors_current (${doctorsCurrent}).`);
+  }
+  if (visitAssigned > maxVisitDoctors) throw new Error(`Слишком много врачей на приемы: ${visitAssigned}, максимум ${maxVisitDoctors}.`);
+  if (ftlAssigned > maxFtlDoctors) throw new Error(`Слишком много врачей на ФТЛ: ${ftlAssigned}, максимум ${maxFtlDoctors}.`);
+  if (hireCount < 0 || fireCount < 0) throw new Error('hire_count и fire_count не могут быть отрицательными.');
+  if (fireCount > doctorsCurrent) throw new Error(`Нельзя уволить ${fireCount} при текущих ${doctorsCurrent}.`);
+  if (roundInput.max_doctor_load_percent <= 0 || roundInput.max_doctor_load_percent > 100) throw new Error('max_doctor_load_percent должен быть в диапазоне (0; 100].');
+  if (roundInput.visit_price < 0 || roundInput.procedure_price < 0) throw new Error('Цены не могут быть отрицательными.');
+  if (roundInput.marketing_budget < 0 || roundInput.training_budget < 0) throw new Error('Бюджеты не могут быть отрицательными.');
+}
+
+function calculateMonthRound_(ctx) {
+  const sessionConfig = ctx.sessionConfig;
+  const tech = ctx.techParams;
+  const prev = ctx.latestState;
+  const inp = ctx.roundInput;
+
+  const roundNo = Number(inp.round_no);
+
+  const reputation = Number(prev.reputation);
+  const service = Number(prev.service);
+  const quality = Number(prev.quality);
+  const burnout = Number(prev.burnout);
+  const loyalty = Number(prev.loyalty);
+  const patientBase = Number(prev.patient_base);
+  const marketSharePrev = Number(prev.market_share);
+  const cashBalanceCurrent = Number(prev.cash_balance);
+  const doctorsCurrent = Number(prev.doctors_current);
+  const visitRooms = Number(prev.visit_rooms);
+  const ftlRooms = Number(prev.ftl_rooms);
+
+  const envEconomy = getNumberOrDefault_(tech, 'env_economy', Number(sessionConfig.env_economy || 50));
+  const envCompetition = getNumberOrDefault_(tech, 'env_competition', Number(sessionConfig.env_competition || 50));
+  const envTotalMarket = getNumberOrDefault_(tech, 'env_total_market', Number(sessionConfig.env_total_market || 1000));
+  const envBaseOrganic = getNumberOrDefault_(tech, 'env_base_organic', Number(sessionConfig.env_base_organic || 100));
+
+  const locationScore = Number(sessionConfig.selected_location_score);
+  const buildingScore = Number(sessionConfig.selected_building_score);
+  const parkingScore = Number(sessionConfig.selected_parking_score);
+  const staffComfort = Number(sessionConfig.selected_staff_comfort);
+  const receptionScore = Number(sessionConfig.selected_reception_score);
+  const kitchenScore = Number(sessionConfig.selected_kitchen_score);
+  const rentCoef = Number(sessionConfig.selected_rent_coef);
+
+  const visitPrice = Number(inp.visit_price);
+  const procedurePrice = Number(inp.procedure_price);
+  const marketingBudget = Number(inp.marketing_budget);
+  const trainingBudget = Number(inp.training_budget);
+  const hireCount = Number(inp.hire_count);
+  const fireCount = Number(inp.fire_count);
+  const doctorsVisitAssigned = Number(inp.doctors_visit_assigned);
+  const doctorsFtlAssigned = Number(inp.doctors_ftl_assigned);
+  const maxDoctorLoadPercent = Number(inp.max_doctor_load_percent);
+
+  const baseVisitPrice = getNumberOrDefault_(sessionConfig, 'initial_visit_price', getNumberOrDefault_(tech, 'initial_visit_price', visitPrice));
+  const baseProcedurePrice = getNumberOrDefault_(sessionConfig, 'initial_procedure_price', getNumberOrDefault_(tech, 'initial_procedure_price', procedurePrice));
+  const baseRentMonth = getNumberOrDefault_(sessionConfig, 'base_rent_month', getNumberOrDefault_(tech, 'base_rent_month', 500000));
+  const doctorSalaryMonth = getNumberOrDefault_(sessionConfig, 'doctor_salary_month', getNumberOrDefault_(tech, 'doctor_salary_month', 250000));
+  const baseAdminCost = getNumberOrDefault_(sessionConfig, 'base_admin_cost', getNumberOrDefault_(tech, 'base_admin_cost', 150000));
+  const baseCpl = getNumberOrDefault_(sessionConfig, 'base_cpl', getNumberOrDefault_(tech, 'base_cpl', 1000));
+
+  const shiftsPerDoctor = getNumberOrDefault_(tech, 'work_shifts_per_month', 15);
+  const visitsPerShift = getNumberOrDefault_(tech, 'visits_per_shift', 10);
+  const proceduresPerShift = getNumberOrDefault_(tech, 'procedures_per_shift', 50);
+  const proceduresPerCourse = getNumberOrDefault_(tech, 'procedures_per_course', 10);
+
+  const stateMin = getNumberOrDefault_(tech, 'state_min', 0);
+  const stateMax = getNumberOrDefault_(tech, 'state_max', 100);
+
+  const alpha = getNumberOrDefault_(tech, 'alpha', 1.2);
+  const beta = getNumberOrDefault_(tech, 'beta', 2);
+
+  const kEconomyToDemand = getNumberOrDefault_(tech, 'k_economy_to_demand', 1.2);
+  const kCompetitionToDemand = getNumberOrDefault_(tech, 'k_competition_to_demand', -1.0);
+  const kReputationToOrganic = getNumberOrDefault_(tech, 'k_reputation_to_organic', 0.8);
+  const kLocationToOrganic = getNumberOrDefault_(tech, 'k_location_to_organic', 0.5);
+
+  const baseBookingRate = getNumberOrDefault_(tech, 'base_booking_rate', 0.5);
+  const bookingRateMin = getNumberOrDefault_(tech, 'booking_rate_min', 0.05);
+  const bookingRateMax = getNumberOrDefault_(tech, 'booking_rate_max', 0.95);
+
+  const kVisitPriceToBooking = getNumberOrDefault_(tech, 'k_visit_price_to_booking', -0.2);
+  const kReputationToBooking = getNumberOrDefault_(tech, 'k_reputation_to_booking', 0.003);
+  const kServiceToBooking = getNumberOrDefault_(tech, 'k_service_to_booking', 0.002);
+  const kBuildingToBooking = getNumberOrDefault_(tech, 'k_building_to_booking', 0.0015);
+  const kParkingToBooking = getNumberOrDefault_(tech, 'k_parking_to_booking', 0.001);
+
+  const baseTreatmentConversion = getNumberOrDefault_(tech, 'base_treatment_conversion', 0.35);
+  const treatmentConversionMin = getNumberOrDefault_(tech, 'treatment_conversion_min', 0.05);
+  const treatmentConversionMax = getNumberOrDefault_(tech, 'treatment_conversion_max', 0.95);
+
+  const kProcedurePriceToConversion = getNumberOrDefault_(tech, 'k_procedure_price_to_conversion', -0.15);
+  const kReputationToConversion = getNumberOrDefault_(tech, 'k_reputation_to_conversion', 0.003);
+  const kServiceToConversion = getNumberOrDefault_(tech, 'k_service_to_conversion', 0.003);
+  const kQualityToConversion = getNumberOrDefault_(tech, 'k_quality_to_conversion', 0.004);
+  const kBurnoutToConversion = getNumberOrDefault_(tech, 'k_burnout_to_conversion', -0.002);
+
+  const baseRepeatRate = getNumberOrDefault_(tech, 'base_repeat_rate', 0.1);
+  const kReputationToRepeat = getNumberOrDefault_(tech, 'k_reputation_to_repeat', 0.01);
+
+  const trainingServiceEffectCoef = getNumberOrDefault_(tech, 'training_service_effect_coef', 0.00001);
+  const trainingQualityEffectCoef = getNumberOrDefault_(tech, 'training_quality_effect_coef', 0.00002);
+  const trainingEffectCap = getNumberOrDefault_(tech, 'training_effect_cap', 5);
+
+  const burnoutServicePenaltyCoef = getNumberOrDefault_(tech, 'burnout_service_penalty_coef', 0.10);
+  const burnoutQualityPenaltyCoef = getNumberOrDefault_(tech, 'burnout_quality_penalty_coef', 0.15);
+  const kLoyaltyToService = getNumberOrDefault_(tech, 'k_loyalty_to_service', 0.03);
+  const kLoyaltyToQuality = getNumberOrDefault_(tech, 'k_loyalty_to_quality', 0.03);
+
+  const qualityReputationBonusCoef = getNumberOrDefault_(tech, 'quality_reputation_bonus_coef', 0.05);
+  const serviceReputationBonusCoef = getNumberOrDefault_(tech, 'service_reputation_bonus_coef', 0.05);
+  const aggressiveSalesReputationPenalty = getNumberOrDefault_(tech, 'aggressive_sales_reputation_penalty', 0.08);
+
+  const stabilityBonus = getNumberOrDefault_(tech, 'stability_bonus', 0);
+  const fireLoyaltyPenalty = getNumberOrDefault_(tech, 'fire_loyalty_penalty', 10);
+
+  const staffComfortBurnoutReliefCoef = getNumberOrDefault_(tech, 'staff_comfort_burnout_relief_coef', 0.03);
+  const kitchenBurnoutReliefCoef = getNumberOrDefault_(tech, 'kitchen_burnout_relief_coef', 0.02);
+
+  const burnoutGrowthMedium = getNumberOrDefault_(tech, 'burnout_growth_medium', 1);
+  const burnoutGrowthHigh = getNumberOrDefault_(tech, 'burnout_growth_high', 3);
+  const burnoutRecoveryIfLowLoad = getNumberOrDefault_(tech, 'burnout_recovery_if_low_load', -2);
+
+  const pressureIndex = getNumberOrDefault_(sessionConfig, 'pressure_index', 0);
+
+  // -----------------------------------------------------------
+  // Hidden state (pre-round deltas for repeat model)
+  // -----------------------------------------------------------
+  const trainingServiceEffect = Math.min(trainingBudget * trainingServiceEffectCoef, trainingEffectCap);
+  const trainingQualityEffect = Math.min(trainingBudget * trainingQualityEffectCoef, trainingEffectCap);
+
+  let loyaltyNext = loyalty + stabilityBonus - fireCount * fireLoyaltyPenalty;
+  loyaltyNext = clamp_(loyaltyNext, stateMin, stateMax);
+
+  let serviceNext = service + loyalty * kLoyaltyToService + trainingServiceEffect - burnout * burnoutServicePenaltyCoef;
+  serviceNext = clamp_(serviceNext, stateMin, stateMax);
+
+  let qualityNext = quality + loyalty * kLoyaltyToQuality + trainingQualityEffect - burnout * burnoutQualityPenaltyCoef;
+  qualityNext = clamp_(qualityNext, stateMin, stateMax);
+
+  const pressurePenalty = pressureIndex * aggressiveSalesReputationPenalty;
+  let reputationNext = reputation + qualityNext * qualityReputationBonusCoef + serviceNext * serviceReputationBonusCoef - pressurePenalty;
+  reputationNext = clamp_(reputationNext, stateMin, stateMax);
+
+  const deltaReputation = reputationNext - reputation;
+
+  let repeatRate =
+    baseRepeatRate +
+    kReputationToRepeat * deltaReputation;
+
+  // Жесткий clamp по ТЗ
+  repeatRate = clamp_(repeatRate, 0, 0.5);
+
+  const visitCapacity = doctorsVisitAssigned * shiftsPerDoctor * visitsPerShift;
+  const procedureCapacity = doctorsFtlAssigned * shiftsPerDoctor * proceduresPerShift;
+
+  const loadFactor = maxDoctorLoadPercent / 100;
+  const visitCapacityLimited = visitCapacity * loadFactor;
+  const procedureCapacityLimited = procedureCapacity * loadFactor;
+
+  const marketingSteps = 10;
+  const marketingBudgetPerStep = safeDiv_(marketingBudget, marketingSteps);
+  let marketShareDynamic = marketSharePrev;
+  let effectiveCpl = baseCpl * (1 + alpha * Math.pow(Math.max(marketShareDynamic, 0), beta));
+  let adLeads = 0;
+
+  for (let step = 0; step < marketingSteps; step += 1) {
+    effectiveCpl = baseCpl * (1 + alpha * Math.pow(Math.max(marketShareDynamic, 0), beta));
+    const stepLeads = safeDiv_(marketingBudgetPerStep, effectiveCpl);
+    adLeads += stepLeads;
+    marketShareDynamic = envTotalMarket > 0 ? Math.min(adLeads, envTotalMarket) / envTotalMarket : 0;
+  }
+
+  let organicLeads =
+    envBaseOrganic +
+    kEconomyToDemand * envEconomy +
+    kCompetitionToDemand * envCompetition +
+    kReputationToOrganic * deltaReputation +
+    kLocationToOrganic * locationScore;
+  organicLeads = Math.max(0, organicLeads);
+
+  const repeatLeads = Math.max(0, patientBase * repeatRate);
+  const newLeadsRaw = adLeads + organicLeads;
+  const newLeads = Math.min(newLeadsRaw, envTotalMarket);
+  const totalLeads = newLeads + repeatLeads;
+  const marketShare = envTotalMarket > 0 ? newLeads / envTotalMarket : 0;
+
+  const visitPriceIndex = safeDiv_(visitPrice, baseVisitPrice);
+  let bookingRate =
+    baseBookingRate +
+    kVisitPriceToBooking * visitPriceIndex +
+    kReputationToBooking * reputation +
+    kServiceToBooking * service +
+    kBuildingToBooking * buildingScore +
+    kParkingToBooking * parkingScore;
+  bookingRate = clamp_(bookingRate, bookingRateMin, bookingRateMax);
+
+  const bookings = totalLeads * bookingRate;
+  const visitsDone = Math.min(bookings, visitCapacityLimited);
+
+  const procedurePriceIndex = safeDiv_(procedurePrice, baseProcedurePrice);
+  let treatmentConversion =
+    baseTreatmentConversion +
+    kProcedurePriceToConversion * procedurePriceIndex +
+    kReputationToConversion * reputation +
+    kServiceToConversion * service +
+    kQualityToConversion * quality +
+    kBurnoutToConversion * burnout;
+  treatmentConversion = clamp_(treatmentConversion, treatmentConversionMin, treatmentConversionMax);
+
+  const treatmentPatientsPotential = visitsDone * treatmentConversion;
+  const treatmentPatients = Math.min(treatmentPatientsPotential, procedureCapacityLimited / proceduresPerCourse);
+  const proceduresDone = treatmentPatients * proceduresPerCourse;
+
+  const visitRevenue = visitsDone * visitPrice;
+  const procedureRevenue = proceduresDone * procedurePrice;
+  const totalRevenue = visitRevenue + procedureRevenue;
+
+  const rentMonth = baseRentMonth * rentCoef;
+  const doctorCost = doctorsCurrent * doctorSalaryMonth;
+  const totalCost = rentMonth + doctorCost + marketingBudget + trainingBudget + baseAdminCost;
+
+  const financialResult = totalRevenue - totalCost;
+  const cashBalanceNext = cashBalanceCurrent + financialResult;
+
+  const visitLoadActual = visitCapacity > 0 ? visitsDone / visitCapacity : 0;
+  const procedureLoadActual = procedureCapacity > 0 ? proceduresDone / procedureCapacity : 0;
+
+  let avgLoadActual = 0;
+  if (visitCapacity > 0 && procedureCapacity > 0) avgLoadActual = (visitLoadActual + procedureLoadActual) / 2;
+  else if (visitCapacity > 0) avgLoadActual = visitLoadActual;
+  else if (procedureCapacity > 0) avgLoadActual = procedureLoadActual;
+
+  let burnoutGrowth = 0;
+  if (avgLoadActual < 0.8) burnoutGrowth = burnoutRecoveryIfLowLoad;
+  else if (avgLoadActual < 0.9) burnoutGrowth = burnoutGrowthMedium;
+  else burnoutGrowth = burnoutGrowthHigh;
+
+  let burnoutNext = burnout + burnoutGrowth - staffComfort * staffComfortBurnoutReliefCoef - kitchenScore * kitchenBurnoutReliefCoef;
+  burnoutNext = clamp_(burnoutNext, stateMin, stateMax);
+
+  const patientBaseNext = patientBase + treatmentPatients;
+  const doctorsNext = doctorsCurrent + hireCount - fireCount;
+
+  return {
+    round_no: roundNo,
+    visit_price: visitPrice,
+    procedure_price: procedurePrice,
+    marketing_budget: marketingBudget,
+    training_budget: trainingBudget,
+    hire_count: hireCount,
+    fire_count: fireCount,
+    doctors_visit_assigned: doctorsVisitAssigned,
+    doctors_ftl_assigned: doctorsFtlAssigned,
+    max_doctor_load_percent: maxDoctorLoadPercent,
+    load_factor: loadFactor,
+
+    doctors_current: doctorsCurrent,
+    visit_rooms: visitRooms,
+    ftl_rooms: ftlRooms,
+    visit_capacity: visitCapacity,
+    procedure_capacity: procedureCapacity,
+    visit_capacity_limited: visitCapacityLimited,
+    procedure_capacity_limited: procedureCapacityLimited,
+
+    effective_cpl: effectiveCpl,
+    ad_leads: adLeads,
+    organic_leads: organicLeads,
+    repeat_rate: repeatRate,
+    repeat_leads: repeatLeads,
+    new_leads_raw: newLeadsRaw,
+    new_leads: newLeads,
+    total_leads: totalLeads,
+    market_share: marketShare,
+
+    visit_price_index: visitPriceIndex,
+    procedure_price_index: procedurePriceIndex,
+    booking_rate: bookingRate,
+    bookings, visits_done: visitsDone, treatment_conversion: treatmentConversion,
+    treatment_patients_potential: treatmentPatientsPotential,
+    treatment_patients: treatmentPatients,
+    procedures_done: proceduresDone,
+
+    visit_revenue: visitRevenue,
+    procedure_revenue: procedureRevenue,
+    total_revenue: totalRevenue,
+    rent_month: rentMonth,
+    doctor_cost: doctorCost,
+    total_cost: totalCost,
+    financial_result: financialResult,
+    cash_balance_next: cashBalanceNext,
+
+    service_next: serviceNext,
+    quality_next: qualityNext,
+    reputation_next: reputationNext,
+    burnout_next: burnoutNext,
+    loyalty_next: loyaltyNext,
+    patient_base_next: patientBaseNext,
+
+    doctors_next: doctorsNext,
+
+    visit_load_actual: visitLoadActual,
+    procedure_load_actual: procedureLoadActual,
+    avg_load_actual: avgLoadActual,
+    burnout_growth: burnoutGrowth
+  };
+}
+
+function appendRoundResult_(sheet, calc, cfg) {
+  ensureRoundResultsHeaders_(sheet);
+
+  const row = [
+    calc.round_no, cfg.teamId, cfg.teamName,
+
+    calc.visit_rooms, calc.ftl_rooms, calc.doctors_current,
+    calc.doctors_visit_assigned, calc.doctors_ftl_assigned,
+
+    calc.max_doctor_load_percent, calc.load_factor,
+
+    calc.effective_cpl, calc.ad_leads, calc.organic_leads, calc.repeat_rate, calc.repeat_leads,
+    calc.new_leads_raw, calc.new_leads, calc.total_leads, calc.market_share,
+
+    calc.visit_price, calc.procedure_price,
+    calc.booking_rate, calc.bookings, calc.visits_done, calc.treatment_conversion,
+    calc.treatment_patients, calc.procedures_done,
+
+    calc.visit_revenue, calc.procedure_revenue, calc.total_revenue,
+
+    calc.rent_month, calc.doctor_cost, calc.total_cost, calc.financial_result, calc.cash_balance_next,
+
+    calc.visit_load_actual, calc.procedure_load_actual, calc.avg_load_actual, calc.burnout_growth,
+
+    'Month calculated'
+  ];
+
+  sheet.appendRow(row);
+  formatSimpleSheet_(sheet, getRoundResultsHeaders_().length);
+}
+
+function appendTeamState_(sheet, calc, cfg) {
+  ensureTeamStateHeaders_(sheet);
+  const latestState = getLatestTeamState_(sheet, cfg.teamId);
+
+  const row = [
+    calc.round_no, cfg.teamId, cfg.teamName,
+    calc.reputation_next, calc.service_next, calc.quality_next, calc.burnout_next, calc.loyalty_next,
+    calc.patient_base_next, calc.market_share, calc.cash_balance_next,
+    calc.doctors_next,
+    Number(latestState.visit_rooms), Number(latestState.ftl_rooms),
+    Number(latestState.max_visit_doctors), Number(latestState.max_ftl_doctors), Number(latestState.total_doctor_slots),
+    calc.max_doctor_load_percent, calc.load_factor,
+    'State after month calculation'
+  ];
+
+  sheet.appendRow(row);
+  formatSimpleSheet_(sheet, getTeamStateHeaders_().length);
+}
+
+function ensureRoundResultsHeaders_(sheet) {
+  if (sheet.getLastRow() > 0) return;
+  const headers = getRoundResultsHeaders_();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  formatSimpleSheet_(sheet, headers.length);
+}
+
+function ensureTeamStateHeaders_(sheet) {
+  if (sheet.getLastRow() > 0) return;
+  const headers = getTeamStateHeaders_();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  formatSimpleSheet_(sheet, headers.length);
+}
+
+function getRoundResultsHeaders_() {
+  return [
+    'round_no', 'team_id', 'team_name',
+    'visit_rooms', 'ftl_rooms', 'doctors_current', 'doctors_visit_assigned', 'doctors_ftl_assigned',
+    'max_doctor_load_percent', 'load_factor',
+    'effective_cpl', 'ad_leads', 'organic_leads', 'repeat_rate', 'repeat_leads',
+    'new_leads_raw', 'new_leads', 'total_leads', 'market_share',
+    'visit_price', 'procedure_price',
+    'booking_rate', 'bookings', 'visits_done', 'treatment_conversion', 'treatment_patients', 'procedures_done',
+    'visit_revenue', 'procedure_revenue', 'total_revenue',
+    'rent_month', 'doctor_cost', 'total_cost', 'financial_result', 'cash_balance_next',
+    'visit_load_actual', 'procedure_load_actual', 'avg_load_actual', 'burnout_growth',
+    'comment'
+  ];
+}
+
+function getTeamStateHeaders_() {
+  return [
+    'round_no', 'team_id', 'team_name',
+    'reputation', 'service', 'quality', 'burnout', 'loyalty',
+    'patient_base', 'market_share', 'cash_balance',
+    'doctors_current', 'visit_rooms', 'ftl_rooms', 'max_visit_doctors', 'max_ftl_doctors', 'total_doctor_slots',
+    'max_doctor_load_percent', 'load_factor',
+    'notes'
+  ];
+}
+
+function readSessionConfigMap_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('SESSION_CONFIG пуст.');
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const key = String(row[1] || '').trim();
+    if (!key) continue;
+    map[key] = row[2];
+  }
+  return map;
+}
+
+function readTechParamsMap_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headerMap = buildHeaderMap_(values[0].map(v => String(v).trim()));
+  const codeIdx = headerMap.parameter_code !== undefined ? headerMap.parameter_code : 1;
+  const valueIdx = headerMap.value !== undefined ? headerMap.value : 2;
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[codeIdx] || '').trim();
+    if (!code) continue;
+    map[code] = row[valueIdx];
+  }
+  return map;
+}
+
+function getLatestTeamState_(sheet, teamId) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('TEAM_STATE пуст. Сначала нужно инициализировать сессию.');
+
+  const headerMap = buildHeaderMap_(values[0]);
+  let latestRow = null;
+  let latestRound = -Infinity;
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const rowTeamId = String(row[headerMap.team_id] || '').trim();
+    const roundNo = Number(row[headerMap.round_no]);
+    if (rowTeamId !== String(teamId)) continue;
+    if (roundNo > latestRound) {
+      latestRound = roundNo;
+      latestRow = row;
+    }
+  }
+
+  if (!latestRow) throw new Error(`Не найдено состояние команды ${teamId} в TEAM_STATE.`);
+
+  const obj = {};
+  Object.keys(headerMap).forEach(key => {
+    obj[key] = latestRow[headerMap[key]];
+  });
+  return obj;
+}
+
+function ensureTechParametersDefaults_(sheet) {
+  if (sheet.getLastRow() > 1) return;
+
+  const rows = [
+    ['block', 'parameter_code', 'value', 'comment'],
+    ['DEFAULT', 'default_marketing_budget', 0, 'Дефолт маркетинга'],
+    ['DEFAULT', 'default_training_budget', 0, 'Дефолт обучения'],
+
+    ['FIN', 'base_rent_month', 500000, 'Базовая аренда'],
+    ['FIN', 'doctor_salary_month', 250000, 'Зарплата врача/мес'],
+    ['FIN', 'base_admin_cost', 150000, 'Постоянные адм. расходы'],
+    ['FUNNEL', 'base_cpl', 1000, 'Базовый CPL'],
+
+    ['CAPACITY', 'work_shifts_per_month', 15, 'Смен на врача'],
+    ['CAPACITY', 'visits_per_shift', 10, 'Приемов за смену'],
+    ['CAPACITY', 'procedures_per_shift', 50, 'Процедур за смену'],
+    ['CAPACITY', 'procedures_per_course', 10, 'Процедур в курсе'],
+
+    ['STATE', 'state_min', 0, 'Мин hidden state'],
+    ['STATE', 'state_max', 100, 'Макс hidden state'],
+
+    ['MODEL', 'alpha', 1.2, 'CPL alpha'],
+    ['MODEL', 'beta', 2, 'CPL beta'],
+    ['MODEL', 'k_economy_to_demand', 1.2, 'Влияние экономики'],
+    ['MODEL', 'k_competition_to_demand', -1.0, 'Влияние конкуренции'],
+    ['MODEL', 'k_reputation_to_organic', 0.8, 'Репутация→органика'],
+    ['MODEL', 'k_location_to_organic', 0.5, 'Локация→органика'],
+
+    ['BOOKING', 'base_booking_rate', 0.5, 'Базовая запись'],
+    ['BOOKING', 'booking_rate_min', 0.05, 'Мин запись'],
+    ['BOOKING', 'booking_rate_max', 0.95, 'Макс запись'],
+    ['BOOKING', 'k_visit_price_to_booking', -0.2, 'Цена приема→запись'],
+    ['BOOKING', 'k_reputation_to_booking', 0.003, 'Репутация→запись'],
+    ['BOOKING', 'k_service_to_booking', 0.002, 'Сервис→запись'],
+    ['BOOKING', 'k_building_to_booking', 0.0015, 'Здание→запись'],
+    ['BOOKING', 'k_parking_to_booking', 0.001, 'Парковка→запись'],
+
+    ['CONV', 'base_treatment_conversion', 0.35, 'Баз. конверсия в лечение'],
+    ['CONV', 'treatment_conversion_min', 0.05, 'Мин конверсия'],
+    ['CONV', 'treatment_conversion_max', 0.95, 'Макс конверсия'],
+    ['CONV', 'k_procedure_price_to_conversion', -0.15, 'Цена процедуры→конверсия'],
+    ['CONV', 'k_reputation_to_conversion', 0.003, 'Репутация→конверсия'],
+    ['CONV', 'k_service_to_conversion', 0.003, 'Сервис→конверсия'],
+    ['CONV', 'k_quality_to_conversion', 0.004, 'Качество→конверсия'],
+    ['CONV', 'k_burnout_to_conversion', -0.002, 'Выгорание→конверсия'],
+
+    ['REPEAT', 'base_repeat_rate', 0.1, 'Базовый repeat'],
+    ['REPEAT', 'repeat_rate_min', 0, 'Мин repeat'],
+    ['REPEAT', 'repeat_rate_max', 0.5, 'Макс repeat'],
+    ['REPEAT', 'k_reputation_to_repeat', 0.01, 'ΔРепутации→repeat'],
+
+    ['STATE_DYN', 'training_service_effect_coef', 0.00001, 'Обучение→сервис'],
+    ['STATE_DYN', 'training_quality_effect_coef', 0.00002, 'Обучение→качество'],
+    ['STATE_DYN', 'training_effect_cap', 5, 'Кэп эффекта обучения'],
+    ['STATE_DYN', 'k_loyalty_to_service', 0.03, 'Лояльность→сервис'],
+    ['STATE_DYN', 'k_loyalty_to_quality', 0.03, 'Лояльность→качество'],
+    ['STATE_DYN', 'burnout_service_penalty_coef', 0.10, 'Выгорание штраф сервис'],
+    ['STATE_DYN', 'burnout_quality_penalty_coef', 0.15, 'Выгорание штраф качество'],
+    ['STATE_DYN', 'quality_reputation_bonus_coef', 0.05, 'Качество→репутация'],
+    ['STATE_DYN', 'service_reputation_bonus_coef', 0.05, 'Сервис→репутация'],
+    ['STATE_DYN', 'aggressive_sales_reputation_penalty', 0.08, 'Агресс. продажи штраф'],
+    ['STATE_DYN', 'stability_bonus', 0, 'Автономный бонус стабильности лояльности'],
+    ['STATE_DYN', 'fire_loyalty_penalty', 10, 'Увольнения штраф лояльности'],
+    ['STATE_DYN', 'staff_comfort_burnout_relief_coef', 0.03, 'Комфорт персонала снижает выгорание'],
+    ['STATE_DYN', 'kitchen_burnout_relief_coef', 0.02, 'Кухня снижает выгорание'],
+    ['STATE_DYN', 'burnout_growth_medium', 1, 'Рост выгорания при средней нагрузке'],
+    ['STATE_DYN', 'burnout_growth_high', 3, 'Рост выгорания при высокой нагрузке'],
+    ['STATE_DYN', 'burnout_recovery_if_low_load', -2, 'Восстановление при низкой нагрузке']
+  ];
+
+  clearSheetCompletely_(sheet);
+  sheet.getRange(1, 1, rows.length, 4).setValues(rows);
+  formatSimpleSheet_(sheet, 4);
+}
+
+function mustGetSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+  if (!sheet) throw new Error(`Не найден лист "${name}"`);
+  return sheet;
+}
+
+function getOrCreateSheet_(ss, sheetName) {
+  return ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+}
+
+function clearSheetCompletely_(sheet) {
+  sheet.clear();
+  sheet.clearFormats();
+  sheet.clearConditionalFormatRules();
+}
+
+function formatSimpleSheet_(sheet, colCount) {
+  sheet.setFrozenRows(1);
+
+  sheet.getRange(1, 1, 1, colCount)
+    .setFontWeight('bold')
+    .setBackground('#d9eaf7')
+    .setWrap(true);
+
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  try {
+    sheet.getRange(1, 1, lastRow, colCount).createFilter();
+  } catch (e) {
+    // фильтр уже есть
+  }
+
+  sheet.getDataRange().setWrap(true).setVerticalAlignment('middle');
+}
+
+function buildHeaderMap_(headers) {
+  const map = {};
+  headers.forEach((h, i) => {
+    map[String(h).trim()] = i;
+  });
+  return map;
+}
+
+function getNumberOrDefault_(obj, key, fallback) {
+  if (!obj || !(key in obj)) return fallback;
+  const n = Number(obj[key]);
+  return isNaN(n) ? fallback : n;
+}
+
+function clamp_(value, minVal, maxVal) {
+  return Math.max(minVal, Math.min(maxVal, value));
+}
+
+function safeDiv_(a, b) {
+  if (!b || b === 0) return 0;
+  return a / b;
+}
+
+function roundNumber_(n) {
+  return Math.round(Number(n) || 0);
+}

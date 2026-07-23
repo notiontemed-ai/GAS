@@ -1,0 +1,617 @@
+/***************************************************************
+ * CLINIC GAME — START SETUP INITIALIZATION HELPERS
+ * -------------------------------------------------------------
+ * Назначение:
+ * - Заполнять на листе START_SETUP значения, отмеченные как
+ *   "Подтянуто из модели".
+ * - Подтягивать финансовые параметры из TECH_PARAMETERS.
+ * - Использовать корректный разделитель аргументов формул Google
+ *   Sheets: ";" (а не ",").
+ ***************************************************************/
+
+const INITIALIZATION_CONFIG = {
+  startSheetName: 'START_SETUP',
+  techSheetName: 'TECH_PARAMETERS',
+  coefficientsSheetName: '08_Coefficients',
+  coefficientsExampleValueHeader: 'Пример значения (input)',
+  constantsSheetName: '07_Constants',
+  constantsValueHeader: 'Значение (input)',
+  lotListSheetName: '12_LotList',
+  hiddenStateSheetName: '05_HiddenState',
+  hiddenStateStartValueHeader: 'Стартовые значения',
+  targetFolderId: '1YSLD4vA-fafm0f7XRjCdVmUOr6Lyqj4O',
+
+  // В колонке E обычно хранится источник значения,
+  // например: "Подтянуто из модели".
+  sourceMarkerText: 'Подтянуто из модели',
+};
+
+
+function onOpenInitialization_() {
+  SpreadsheetApp.getUi()
+    .createMenu('Clinic Game Session')
+    .addItem('Create new game session from catalog', 'createNewGameSessionFromCatalog')
+    .addSeparator()
+    .addItem('Sync START_SETUP with lot catalog', 'syncStartSetupWithLotCatalog')
+    .addItem('Prepare ROUND_INPUT for next month', 'prepareRoundInputForNextMonth')
+    .addItem('Run next month round', 'runNextMonthRound')
+    .addToUi();
+}
+
+
+/**
+ * Создает новый файл игровой сессии из текущего каталога.
+ *
+ * Поведение:
+ * - создает новую таблицу;
+ * - копирует из текущей таблицы листы START_SETUP / TECH_PARAMETERS, если они есть;
+ * - если листов нет, создает их по шаблону;
+ * - в новой таблице подготавливает START_SETUP значениями из модели.
+ */
+function createNewGameSessionFromCatalog() {
+  const cfg = INITIALIZATION_CONFIG;
+
+  const catalogSs = SpreadsheetApp.getActiveSpreadsheet();
+  const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Europe/Paris', 'yyyy-MM-dd HH:mm');
+  const newSs = SpreadsheetApp.create(`Clinic Game Session ${ts}`);
+
+  moveSpreadsheetToTargetFolder_(newSs, cfg.targetFolderId);
+
+  const sheets = bootstrapRequiredSheetsInNewSession_(catalogSs, newSs, cfg);
+  const startSheet = sheets.startSheet;
+  const techSheet = sheets.techSheet;
+
+  ensureTechParametersTemplateForInit_(techSheet, catalogSs);
+  ensureStartSetupTemplateForInit_(startSheet, cfg.sourceMarkerText);
+  applyLotBindingsInStartSetup_(newSs);
+
+  cleanupDefaultSheetInNewSession_(newSs, cfg);
+
+  // Заполняем только в новой книге (аналог fillStartSetupFromModel, но без привязки к active ss).
+  fillStartSetupFromModelInSpreadsheet_(newSs);
+
+  showSessionCreatedDialog_(newSs.getUrl());
+}
+
+function showSessionCreatedDialog_(url) {
+  const safeUrl = String(url || '').replace(/"/g, '&quot;');
+  const html = HtmlService.createHtmlOutput(
+    '<div style="font-family:Arial,sans-serif;padding:12px;line-height:1.5">' +
+      '<div style="margin-bottom:10px"><b>Создан новый файл игровой сессии.</b></div>' +
+      '<div style="margin-bottom:10px"><a href="' + safeUrl + '" target="_blank">Ссылка</a></div>' +
+      '<div>Далее откройте файл и запустите <b>Initialize session from START_SETUP</b>.</div>' +
+    '</div>'
+  ).setWidth(420).setHeight(180);
+
+  SpreadsheetApp.getUi().showModalDialog(html, 'Game session created');
+}
+
+
+function cleanupDefaultSheetInNewSession_(ss, cfg) {
+  const sheets = ss.getSheets();
+  if (sheets.length <= 1) return;
+
+  const protectedNames = {
+    [cfg.startSheetName]: true,
+    [cfg.techSheetName]: true,
+    [cfg.lotListSheetName]: true,
+    SESSION_CONFIG: true,
+    TEAM_STATE: true,
+    ROUND_RESULTS: true,
+    ROUND_INPUT: true
+  };
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sh = sheets[i];
+    const name = sh.getName();
+    const looksDefault = /^Sheet\d*$/.test(name);
+    if (!looksDefault) continue;
+    if (protectedNames[name]) continue;
+    if (ss.getSheets().length <= 1) return;
+    ss.deleteSheet(sh);
+    return;
+  }
+}
+
+function moveSpreadsheetToTargetFolder_(ss, folderId) {
+  if (!folderId) return;
+
+  const file = DriveApp.getFileById(ss.getId());
+  const targetFolder = DriveApp.getFolderById(folderId);
+  file.moveTo(targetFolder);
+}
+
+function fillStartSetupFromModelInSpreadsheet_(ss) {
+  syncStartSetupWithLotCatalogInSpreadsheet_(ss);
+}
+
+function bootstrapRequiredSheetsInNewSession_(sourceSs, targetSs, cfg) {
+  const allSheets = targetSs.getSheets();
+
+  // Если есть только дефолтный лист, переиспользуем его как START_SETUP,
+  // чтобы новая книга точно не оставалась "пустой".
+  let startSheet = targetSs.getSheetByName(cfg.startSheetName);
+  if (!startSheet && allSheets.length === 1 && isDefaultSheetName_(allSheets[0].getName())) {
+    allSheets[0].setName(cfg.startSheetName);
+    startSheet = allSheets[0];
+  }
+  if (!startSheet) {
+    startSheet = getOrCreateSheetForInit_(targetSs, cfg.startSheetName);
+  }
+
+  let techSheet = targetSs.getSheetByName(cfg.techSheetName);
+  if (!techSheet) {
+    techSheet = getOrCreateSheetForInit_(targetSs, cfg.techSheetName);
+  }
+
+  const lotSheet = getOrCreateSheetForInit_(targetSs, cfg.lotListSheetName);
+
+  const copiedStart = copySheetValuesByName_(sourceSs, startSheet, cfg.startSheetName);
+  const copiedTech = copySheetValuesByName_(sourceSs, techSheet, cfg.techSheetName);
+  const copiedLot = copySheetValuesByName_(sourceSs, lotSheet, cfg.lotListSheetName);
+
+  if (!copiedStart) {
+    ensureStartSetupTemplateForInit_(startSheet, cfg.sourceMarkerText);
+  }
+  if (!copiedTech) {
+    ensureTechParametersTemplateForInit_(techSheet, sourceSs);
+  }
+  if (!copiedLot) {
+    ensureLotListTemplateForInit_(lotSheet);
+  }
+
+  return { startSheet, techSheet };
+}
+
+function copySheetValuesByName_(sourceSs, targetSheet, sourceSheetName) {
+  const src = sourceSs.getSheetByName(sourceSheetName);
+  if (!src) return false;
+
+  const values = src.getDataRange().getValues();
+  targetSheet.clear();
+
+  if (!values || values.length === 0) return true;
+  targetSheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+
+  return true;
+}
+
+function isDefaultSheetName_(name) {
+  return /^Sheet\d*$/.test(name) || /^Лист\d*$/.test(name);
+}
+
+
+/**
+ * Основной публичный entry point.
+ *
+ * Что делает:
+ * 1) читает START_SETUP
+ * 2) находит строки "Подтянуто из модели"
+ * 3) подтягивает значения из TECH_PARAMETERS
+ * 4) отдельно гарантирует заполнение обязательных кодов
+ * 5) выводит отчет по заполненным/пропущенным параметрам
+ */
+function syncStartSetupWithLotCatalog() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  syncStartSetupWithLotCatalogInSpreadsheet_(ss);
+  SpreadsheetApp.getUi().alert('START_SETUP синхронизирован с 12_LotList по selected_lot_id.');
+}
+
+function fillStartSetupFromModel() {
+  // backward compatibility
+  syncStartSetupWithLotCatalog();
+}
+
+function syncStartSetupWithLotCatalogInSpreadsheet_(ss) {
+  const cfg = INITIALIZATION_CONFIG;
+  const startSheet = getOrCreateSheetForInit_(ss, cfg.startSheetName);
+  ensureStartSetupTemplateForInit_(startSheet, cfg.sourceMarkerText);
+  applyLotBindingsInStartSetup_(ss);
+}
+
+/**
+ * Опциональный helper, если нужно проставить формулы в START_SETUP.
+ * ВАЖНО: разделитель аргументов в формулах — ";".
+ *
+ * Пример использования:
+ * setStartSetupFormulaByCode_('selected_lot_name', '=IFERROR(VLOOKUP(D2;LOT_DIRECTORY!A:Z;2;FALSE);"")');
+ */
+function setStartSetupFormulaByCode_(parameterCode, formulaA1) {
+  const cfg = INITIALIZATION_CONFIG;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const startSheet = mustGetSheetForInit_(ss, cfg.startSheetName);
+
+  const values = startSheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('START_SETUP пуст.');
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const h = buildHeaderMapForInit_(headers);
+
+  const colParameterCode = pickHeaderIndex_(h, ['parameter_code'], 1);
+  const colValueInput = pickHeaderIndex_(h, ['value_input'], 3);
+
+  let targetRow = null;
+  for (let r = 1; r < values.length; r++) {
+    const code = String(values[r][colParameterCode] || '').trim();
+    if (code === parameterCode) {
+      targetRow = r + 1;
+      break;
+    }
+  }
+
+  if (!targetRow) {
+    throw new Error(`В START_SETUP не найден parameter_code=${parameterCode}`);
+  }
+
+  // Проверка на случайно переданный запятый разделитель.
+  if (formulaA1.indexOf(',') >= 0 && formulaA1.indexOf(';') < 0) {
+    throw new Error('Формула содержит ",". Для Google Sheets используйте ";" как разделитель аргументов.');
+  }
+
+  startSheet.getRange(targetRow, colValueInput + 1).setFormula(formulaA1);
+}
+
+function readTechParametersMapForInit_(techSheet) {
+  const values = techSheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const h = buildHeaderMapForInit_(headers);
+
+  const colCode = pickHeaderIndex_(h, ['parameter_code'], 1);
+  const colValue = pickHeaderIndex_(h, ['value'], 2);
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[colCode] || '').trim();
+    if (!code) continue;
+    map[code] = row[colValue];
+  }
+  return map;
+}
+
+function resolveModelValueByCode_(techMap, code) {
+  if (!techMap) return null;
+
+  // Прямое совпадение
+  if (code in techMap) return techMap[code];
+
+  // Частые алиасы для start_cash_balance
+  if (code === 'start_cash_balance') {
+    if ('default_start_cash_balance' in techMap) return techMap.default_start_cash_balance;
+    if ('starting_cash_balance' in techMap) return techMap.starting_cash_balance;
+  }
+
+  return null;
+}
+
+function buildStartSetupRowByCode_(startValues, colParameterCode) {
+  const map = {};
+  for (let r = 1; r < startValues.length; r++) {
+    const code = String(startValues[r][colParameterCode] || '').trim();
+    if (!code) continue;
+    map[code] = r + 1;
+  }
+  return map;
+}
+
+function isModelPulledMarker_(source, marker) {
+  return String(source || '').toLowerCase().indexOf(String(marker || '').toLowerCase()) >= 0;
+}
+
+
+function ensureStartSetupTemplateForInit_(sheet, sourceMarkerText) {
+  if (sheet.getLastRow() > 1) return;
+
+  const headers = [
+    'block','parameter_code','parameter_name','value_input','default_or_source','who_fills','gameplay_effect'
+  ];
+
+  const rows = [
+    headers,
+    ['TEAM','team_name','Название команды','Main Team','Ручной ввод','player','Идентификация команды'],
+    ['LOT','selected_lot_id','ID выбранного лота','LOT_01','Ручной ввод','player','Выбор помещения'],
+    ['LOT','selected_lot_name','Название лота','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;2;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_total_cabinets','Всего кабинетов','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;3;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_rent_coef','Коэф. аренды','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;4;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_location_score','Сила локации','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;5;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_building_score','Качество здания','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;6;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_parking_score','Парковка','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;7;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_staff_comfort','Комфорт персонала','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;8;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_reception_score','Ресепшн','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;9;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['LOT','selected_kitchen_score','Бытовой комфорт','=IFERROR(VLOOKUP($D$3;12_LotList!$A:$J;10;FALSE);"")','Формула из 12_LotList','formula','Авто из каталога'],
+    ['ROOMS','visit_rooms','Приемные кабинеты',0,'Ручной ввод','player','visit_rooms + ftl_rooms = total'],
+    ['ROOMS','ftl_rooms','ФТЛ кабинеты',0,'Ручной ввод','player','visit_rooms + ftl_rooms = total'],
+    ['HR','doctors_start','Врачей на старте',0,'Ручной ввод','player','<= total_cabinets*2']
+  ];
+
+  sheet.clear();
+  sheet.getRange(1,1,rows.length,headers.length).setValues(rows);
+  // Устанавливаем формулы корректно с разделителем ';'
+  for (let r=4; r<=11; r++) {
+    const f = rows[r-1][3];
+    sheet.getRange(r,4).setFormula(f);
+  }
+}
+
+function applyLotBindingsInStartSetup_(ss) {
+  const cfg = INITIALIZATION_CONFIG;
+  const startSheet = ss.getSheetByName(cfg.startSheetName);
+  const lotSheet = ss.getSheetByName(cfg.lotListSheetName);
+  if (!startSheet || !lotSheet) return;
+
+  // D3 — value_input для selected_lot_id в шаблоне START_SETUP.
+  const lotIdCell = startSheet.getRange(3, 4);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(lotSheet.getRange('A2:A'), true)
+    .setAllowInvalid(false)
+    .build();
+  lotIdCell.setDataValidation(rule);
+}
+
+function ensureLotListTemplateForInit_(sheet) {
+  if (sheet.getLastRow() > 1) return;
+
+  const rows = [
+    ['lot_id', 'lot_name', 'total_cabinets', 'rent_coef', 'location_score', 'building_score', 'parking_score', 'staff_comfort', 'reception_score', 'kitchen_score'],
+    ['LOT_01', 'Default Lot', 10, 1, 50, 50, 50, 50, 50, 50]
+  ];
+
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function ensureTechParametersTemplateForInit_(sheet, sourceSs) {
+  if (sheet.getLastRow() > 1) return;
+
+  const rows = buildTechMasterRegistryRows_(sourceSs || SpreadsheetApp.getActiveSpreadsheet());
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, 4).setValues(rows);
+}
+
+function buildTechMasterRegistryRows_(ss) {
+  const coeffRows = buildTechRowsFromCoefficients_(ss) || [['block','parameter_code','value','comment']];
+  const map = {};
+  for (let i=1;i<coeffRows.length;i++) {
+    map[String(coeffRows[i][1]).trim()] = coeffRows[i][2];
+  }
+
+  const hiddenStart = buildHiddenStateStartMap_(ss);
+  const constantsMap = buildConstantsMap_(ss);
+  const startCashFromCoeff = getCoefficientValueByCode_(ss, 'start_cash_balance');
+  if (startCashFromCoeff === null || startCashFromCoeff === undefined || startCashFromCoeff === '') {
+    throw new Error('В 08_Coefficients отсутствует start_cash_balance в колонке "Пример значения (input)".');
+  }
+
+  const pick = (k, d) => (k in map && map[k] !== '' && map[k] !== null && map[k] !== undefined) ? map[k] : d;
+  const pickConst = (k, d) => (k in constantsMap && constantsMap[k] !== '' && constantsMap[k] !== null && constantsMap[k] !== undefined) ? constantsMap[k] : d;
+  const pickHidden = (keys, d) => {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (k in hiddenStart && hiddenStart[k] !== '' && hiddenStart[k] !== null && hiddenStart[k] !== undefined) return hiddenStart[k];
+    }
+    return d;
+  };
+
+  const rows = [
+    ['block','parameter_code','value','comment'],
+    ['FIN','base_cpl', pick('base_cpl',1000), 'Master registry'],
+    ['FIN','base_rent_month', pick('base_rent_month',500000), 'Master registry'],
+    ['FIN','doctor_salary_month', pick('doctor_salary_month',250000), 'Master registry'],
+    ['FIN','base_admin_cost', pick('base_admin_cost',150000), 'Master registry'],
+    ['FIN','start_cash_balance', startCashFromCoeff, 'Master registry (from 08_Coefficients)'],
+    ['FIN','base_visit_price', pick('base_visit_price', pick('initial_visit_price', 3000)), 'Master registry (from 08_Coefficients)'],
+    ['FIN','base_procedure_price', pick('base_procedure_price', pick('initial_procedure_price', 500)), 'Master registry (from 08_Coefficients)'],
+
+    ['CAPACITY','work_shifts_per_doctor', pickConst('work_shifts_per_doctor', 15), 'Imported from 07_Constants / Значение (input)'],
+    ['CAPACITY','work_shifts_per_month', pickConst('work_shifts_per_doctor', pick('work_shifts_per_month',15)), 'Alias for engine compatibility'],
+    ['CAPACITY','visits_per_shift', pickConst('visits_per_shift',10), 'Imported from 07_Constants / Значение (input)'],
+    ['CAPACITY','procedures_per_shift', pickConst('procedures_per_shift',50), 'Imported from 07_Constants / Значение (input)'],
+    ['CAPACITY','procedures_per_course', pickConst('procedures_per_course',10), 'Imported from 07_Constants / Значение (input)'],
+
+    ['LIMITS','state_min', pickConst('state_min',0), 'Imported from 07_Constants / Значение (input)'],
+    ['LIMITS','state_max', pickConst('state_max',100), 'Imported from 07_Constants / Значение (input)'],
+
+    ['MODEL','alpha', pick('alpha',1.2), 'Master registry'],
+    ['MODEL','beta', pick('beta',2), 'Master registry'],
+    ['MODEL','base_booking_rate', pick('base_booking_rate',0.5), 'Master registry'],
+    ['MODEL','base_treatment_conversion', pick('base_treatment_conversion',0.35), 'Master registry'],
+    ['MODEL','base_repeat_rate', pick('base_repeat_rate',0.15), 'Master registry'],
+
+    ['STATE_START','reputation_start', pickHidden(['reputation_start','reputation'], 50), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','service_start', pickHidden(['service_start','service'], 50), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','quality_start', pickHidden(['quality_start','quality'], 50), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','burnout_start', pickHidden(['burnout_start','burnout'], 20), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','loyalty_start', pickHidden(['loyalty_start','loyalty'], 50), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','patient_base_start', pickHidden(['patient_base_start','patient_base'], 200), 'Imported from 05_HiddenState / Стартовые значения'],
+    ['STATE_START','market_share_start', pickHidden(['market_share_start','market_share'], 0.05), 'Imported from 05_HiddenState / Стартовые значения'],
+  ];
+
+
+  const requestedCoeffKeys = [
+    'k_service_to_booking','k_building_to_booking','k_parking_to_booking',
+    'k_procedure_price_to_conversion','k_reputation_to_conversion','k_service_to_conversion','k_quality_to_conversion','k_burnout_to_conversion',
+    'k_reputation_to_repeat','k_quality_to_repeat','k_service_to_repeat','k_loyalty_to_repeat',
+    'reception_service_bonus_coef','training_service_effect_coef','training_quality_effect_coef','training_effect_cap',
+    'burnout_service_penalty_coef','burnout_quality_penalty_coef','staff_comfort_burnout_relief_coef','kitchen_burnout_relief_coef',
+    'quality_reputation_bonus_coef','service_reputation_bonus_coef','aggressive_sales_reputation_penalty',
+    'quality_loyalty_bonus_coef','service_loyalty_bonus_coef','reputation_loyalty_bonus_coef','fire_loyalty_penalty'
+  ];
+  requestedCoeffKeys.forEach(k => {
+    if (k in map && map[k] !== '' && map[k] !== null && map[k] !== undefined) {
+      rows.push(['MODEL', k, map[k], 'Imported from 08_Coefficients / Пример значения (input)']);
+    }
+  });
+
+  Object.keys(map).sort().forEach(k => {
+    if (!/^k_/.test(k)) return;
+    const exists = rows.some(r => r[1] === k);
+    if (!exists) rows.push(['MODEL', k, map[k], 'Imported k_ coefficient']);
+  });
+
+  return rows;
+}
+
+function buildTechRowsFromCoefficients_(ss) {
+  if (!ss) return null;
+
+  const cfg = INITIALIZATION_CONFIG;
+  const coeffSheet = ss.getSheetByName(cfg.coefficientsSheetName);
+  if (!coeffSheet) return null;
+
+  const values = coeffSheet.getDataRange().getValues();
+  if (!values || values.length < 2) return null;
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const hm = buildHeaderMapForInit_(headers);
+  const hmLower = buildHeaderMapForInit_(headers.map(h => String(h).toLowerCase()));
+
+  const codeIdx = pickHeaderIndex_(hm, ['parameter_code','code','Код'],
+    pickHeaderIndex_(hmLower, ['parameter_code','code','код'], 1));
+  const blockIdx = pickHeaderIndex_(hm, ['block','Блок'],
+    pickHeaderIndex_(hmLower, ['block','блок'], 0));
+  const valueIdx = pickHeaderIndex_(hm, [cfg.coefficientsExampleValueHeader, 'Значение (input)', 'value'],
+    pickHeaderIndex_(hmLower, [String(cfg.coefficientsExampleValueHeader).toLowerCase(), 'значение (input)', 'value'], 4));
+
+  const rows = [['block', 'parameter_code', 'value', 'comment']];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[codeIdx] || '').trim();
+    if (!code) continue;
+    const block = String(row[blockIdx] || 'COEFF').trim() || 'COEFF';
+    const v = row[valueIdx];
+    if (v === '' || v === null || v === undefined) continue;
+    rows.push([block, code, v, 'Imported from 08_Coefficients / Пример значения (input)']);
+  }
+
+  return rows.length > 1 ? rows : null;
+}
+
+
+
+function buildConstantsMap_(ss) {
+  if (!ss) return {};
+  const cfg = INITIALIZATION_CONFIG;
+  const sheet = ss.getSheetByName(cfg.constantsSheetName);
+  if (!sheet) return {};
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return {};
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const hm = buildHeaderMapForInit_(headers);
+  const hmLower = buildHeaderMapForInit_(headers.map(h => String(h).toLowerCase()));
+
+  const codeIdx = pickHeaderIndex_(hm, ['parameter_code','code','Код'],
+    pickHeaderIndex_(hmLower, ['parameter_code','code','код'], 1));
+  const valueIdx = pickHeaderIndex_(hm, [cfg.constantsValueHeader, 'value', 'Значение'],
+    pickHeaderIndex_(hmLower, [String(cfg.constantsValueHeader).toLowerCase(), 'value', 'значение'], 4));
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[codeIdx] || '').trim();
+    if (!code) continue;
+    const v = row[valueIdx];
+    if (v === '' || v === null || v === undefined) continue;
+    map[code] = v;
+  }
+  return map;
+}
+
+function buildHiddenStateStartMap_(ss) {
+  if (!ss) return {};
+  const cfg = INITIALIZATION_CONFIG;
+  const sheet = ss.getSheetByName(cfg.hiddenStateSheetName);
+  if (!sheet) return {};
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return {};
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const hm = buildHeaderMapForInit_(headers);
+  const hmLower = buildHeaderMapForInit_(headers.map(h => String(h).toLowerCase()));
+
+  const codeIdx = pickHeaderIndex_(hm, ['parameter_code','code','Код'],
+    pickHeaderIndex_(hmLower, ['parameter_code','code','код'], 1));
+  const startIdx = pickHeaderIndex_(hm, [cfg.hiddenStateStartValueHeader, 'start_value', 'Стартовые значения'],
+    pickHeaderIndex_(hmLower, [String(cfg.hiddenStateStartValueHeader).toLowerCase(), 'start_value', 'стартовые значения'], 3));
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[codeIdx] || '').trim();
+    if (!code) continue;
+    const v = row[startIdx];
+    if (v === '' || v === null || v === undefined) continue;
+    map[code] = v;
+  }
+
+  return map;
+}
+
+
+function getCoefficientValueByCode_(ss, codeToFind) {
+  if (!ss) return null;
+  const cfg = INITIALIZATION_CONFIG;
+  const sheet = ss.getSheetByName(cfg.coefficientsSheetName);
+  if (!sheet) return null;
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return null;
+
+  const headers = values[0].map(v => String(v || '').trim());
+  const hm = buildHeaderMapForInit_(headers);
+  const hmLower = buildHeaderMapForInit_(headers.map(h => String(h).toLowerCase()));
+
+  const codeIdx = pickHeaderIndex_(hm, ['parameter_code','code','Код'],
+    pickHeaderIndex_(hmLower, ['parameter_code','code','код'], 1));
+  const valueIdx = pickHeaderIndex_(hm, [cfg.coefficientsExampleValueHeader, 'Значение (input)', 'value'],
+    pickHeaderIndex_(hmLower, [String(cfg.coefficientsExampleValueHeader).toLowerCase(), 'значение (input)', 'value'], 4));
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[codeIdx] || '').trim();
+    if (code !== codeToFind) continue;
+    const v = row[valueIdx];
+    if (v === '' || v === null || v === undefined) return null;
+    return v;
+  }
+
+  return null;
+}
+
+function getOrCreateSheetForInit_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function mustGetSheetForInit_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+  if (!sheet) throw new Error(`Не найден лист "${name}"`);
+  return sheet;
+}
+
+function buildHeaderMapForInit_(headers) {
+  const map = {};
+  headers.forEach((v, i) => {
+    map[String(v || '').trim()] = i;
+  });
+  return map;
+}
+
+function pickHeaderIndex_(map, variants, fallbackIndex) {
+  for (let i = 0; i < variants.length; i++) {
+    const key = variants[i];
+    if (key in map) return map[key];
+  }
+  return fallbackIndex;
+}
+
+function unique_(arr) {
+  const s = {};
+  (arr || []).forEach(v => {
+    s[String(v)] = true;
+  });
+  return Object.keys(s);
+}
